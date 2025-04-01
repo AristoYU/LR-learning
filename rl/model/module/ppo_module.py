@@ -3,7 +3,7 @@
 """
 # @Author: AristoYU
 # @Date: 2025-03-26 10:03:36
-# @LastEditTime: 2025-04-01 14:51:58
+# @LastEditTime: 2025-04-01 18:54:28
 # @LastEditors: AristoYU
 # @Description: 
 # @FilePath: /LR-learning/rl/model/module/ppo_module.py
@@ -249,6 +249,9 @@ class PPOLightningModule(LightningModule):
         self.val_env = self._load_env(self.hparams.env_cfg, {'batch_size': 1},
                                       os.path.join(self.hparams.running_cfg.get('log_root', ''), 'video', 'val'),
                                       self.hparams.running_cfg.get('seed', 42))
+        self.test_env = self._load_env(self.hparams.env_cfg, {'batch_size': 1},
+                                       os.path.join(self.hparams.running_cfg.get('log_root', ''), 'video', 'test'),
+                                       self.hparams.running_cfg.get('seed', 42))
 
         self.replay_buffer = self._load_replay_buffer(data_cfg)
         self.ppo_model: PPOModule = PPOModule(envs=self.train_envs, **ppo_cfg)
@@ -343,6 +346,27 @@ class PPOLightningModule(LightningModule):
         self.train_envs.close()
         self.val_env.close()
 
+    def test_step(self, *args, **kwargs):
+        step = 0
+        done = False
+        cumulative_rew = 0
+        next_obs = torch.tensor(self.test_env.reset(seed=self.hparams.running_cfg.get('seed', 42))[0], device=self.device)
+        while not done:
+            action = self(next_obs, greedy=True)
+            next_obs, reward, done, truncate, _ = self.test_env.step(action.cpu().numpy())
+            done = done or truncate
+            cumulative_rew += reward
+            next_obs = torch.tensor(next_obs, device=self.device)
+            step += 1
+
+        self.log('test/episode_reward', cumulative_rew.item(), prog_bar=True, on_step=False, on_epoch=True, logger=True)
+        self.log('test/episode_steps', step, prog_bar=True, on_step=False, on_epoch=True, logger=True)
+
+        return {'loss': 0}
+
+    def on_test_end(self):
+        self.test_env.close()
+
     def reset_metrics(self):
         self.avg_pg_loss.reset()
         self.avg_value_loss.reset()
@@ -350,7 +374,10 @@ class PPOLightningModule(LightningModule):
 
     def configure_optimizers(self):
         lr = self.hparams.optim_cfg.get('lr', 1e-4)
-        return torch.optim.Adam(self.parameters(), lr=lr, eps=1e-4)
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr, eps=1e-4)
+        exp_gamma = self.hparams.optim_cfg.get('exp_gamma', 0.99)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=exp_gamma)
+        return dict(optimizer=optimizer, lr_scheduler=scheduler)
 
     def _load_loss(self, loss_cfg: dict):
         self.policy_loss = policy_loss_factory(**loss_cfg['policy_loss'])
@@ -467,3 +494,6 @@ class PPOLightningModule(LightningModule):
 
         dataset = FakeDataset(list([i for i in range(1)]))
         return DataLoader(dataset, batch_size=1)
+
+    def test_dataloader(self):
+        return self.val_dataloader()
