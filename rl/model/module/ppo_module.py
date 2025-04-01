@@ -3,16 +3,19 @@
 """
 # @Author: AristoYU
 # @Date: 2025-03-26 10:03:36
-# @LastEditTime: 2025-03-26 10:55:14
+# @LastEditTime: 2025-04-01 14:51:58
 # @LastEditors: AristoYU
 # @Description: 
 # @FilePath: /LR-learning/rl/model/module/ppo_module.py
 """
 
 from copy import deepcopy
+import logging
 import math
 from typing import Optional
 import os
+
+from loguru import logger
 
 import gymnasium as gym
 import numpy as np
@@ -20,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Normal
 from lightning.pytorch import LightningModule
 from torchmetrics import MeanMetric
 
@@ -87,13 +90,22 @@ class PPOConvMoudleBase(nn.Module):
 
 class PPOActorModule(nn.Module):
 
-    def __init__(self, net_cfg: dict, envs: gym.vector.SyncVectorEnv, use_mlp: bool = False, use_conv: bool = False):
+    def __init__(self, net_cfg: dict, envs: gym.vector.SyncVectorEnv, use_mlp: bool = False, use_conv: bool = False,
+                 continue_mode: bool = False):
         super().__init__()
 
         assert not (use_mlp and use_conv), '`use_mlp` and `use_conv` cannot be True at the same time'
         assert use_mlp or use_conv, '`use_mlp` and `use_conv` cannot be False at the same time'
 
-        out_channels = envs.single_action_space.n
+        self.continue_mode = continue_mode
+
+        out_channels = envs.single_action_space.n if not continue_mode else envs.single_action_space.shape[0] * 2
+
+        if continue_mode:
+            logger.info(f'Using continuous action space, actor output shape: {out_channels}')
+        else:
+            logger.info(f'Using discrete action space, actor output shape: {out_channels}')
+
         if use_mlp:
             inp_channels = math.prod(envs.single_observation_space.shape)
             self._net = PPOLinearModuleBase(net_cfg, inp_channels, out_channels)
@@ -103,6 +115,37 @@ class PPOActorModule(nn.Module):
 
     def forward(self, x: torch.Tensor):
         return self._net(x)
+
+    def get_discrete_action(self, obs: torch.Tensor, act: Optional[torch.Tensor] = None, greedy: bool = False):
+        act_logits = self(obs)
+        if greedy:
+            probs = F.softmax(act_logits, dim=-1)
+            return torch.argmax(probs, dim=-1)
+        else:
+            dist = Categorical(logits=act_logits)
+            if act is None:
+                act = dist.sample()
+            return act, dist.log_prob(act), dist.entropy()
+
+    def get_continuous_action(self, obs: torch.Tensor, act: Optional[torch.Tensor] = None, greedy: bool = False):
+        act_dist = self(obs)
+        mean, logvar = torch.chunk(act_dist, 2, dim=-1)
+        if greedy:
+            return mean
+        else:
+            std = torch.exp(0.5 * logvar)
+            dist = Normal(mean, std ** 0.5)
+            if act is None:
+                act = dist.sample()
+            log_prob = dist.log_prob(act)
+            ent = dist.entropy()
+            return act, log_prob, ent
+
+    def get_action(self, obs: torch.Tensor, act: Optional[torch.Tensor] = None, greedy: bool = False):
+        if self.continue_mode:
+            return self.get_continuous_action(obs, act, greedy)
+        else:
+            return self.get_discrete_action(obs, act, greedy)
 
 
 class PPOCriticModule(nn.Module):
@@ -135,16 +178,7 @@ class PPOModule(nn.Module):
         self.critic: PPOCriticModule = PPOCriticModule(**critic_cfg, envs=envs)
 
     def get_action(self, obs: torch.Tensor, act: Optional[torch.Tensor] = None, greedy: bool = False):
-        act_logits = self.actor(obs)
-        # TODO: add continuous action space support
-        if greedy:
-            probs = F.softmax(act_logits, dim=-1)
-            return torch.argmax(probs, dim=-1)
-        else:
-            dist = Categorical(logits=act_logits)
-            if act is None:
-                act = dist.sample()
-            return act, dist.log_prob(act), dist.entropy()
+        return self.actor.get_action(obs, act, greedy)
 
     def get_value(self, obs: torch.Tensor):
         return self.critic(obs)
@@ -237,7 +271,8 @@ class PPOLightningModule(LightningModule):
         self.observations_buffer = torch.zeros((num_steps, self.train_envs.num_envs) + self.observation_shape,
                                                device=self.device)
         self.actions_buffer = torch.zeros((num_steps, self.train_envs.num_envs) + self.action_shape, device=self.device)
-        self.log_probs_buffer = torch.zeros((num_steps, self.train_envs.num_envs), device=self.device)
+        self.log_probs_buffer = torch.zeros((num_steps, self.train_envs.num_envs) + self.action_shape,
+                                            device=self.device)
         self.rewards_buffer = torch.zeros((num_steps, self.train_envs.num_envs), device=self.device)
         self.dones_buffer = torch.zeros((num_steps, self.train_envs.num_envs), device=self.device)
         self.values_buffer = torch.zeros((num_steps, self.train_envs.num_envs), device=self.device)
@@ -369,7 +404,7 @@ class PPOLightningModule(LightningModule):
                                                                              next_dones, num_steps, gamma, gae_lambda)
 
         obs_data = self.observations_buffer.reshape((-1,) + self.observation_shape)
-        log_prob_data = self.log_probs_buffer.reshape(-1)
+        log_prob_data = self.log_probs_buffer.reshape((-1,) + self.action_shape)
         act_data = self.actions_buffer.reshape((-1,) + self.action_shape)
         adv_data = advantages.reshape(-1)
         ret_data = returns.reshape(-1)

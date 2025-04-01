@@ -3,7 +3,7 @@
 """
 # @Author: AristoYU
 # @Date: 2025-03-26 09:42:21
-# @LastEditTime: 2025-03-26 09:42:21
+# @LastEditTime: 2025-04-01 14:55:26
 # @LastEditors: AristoYU
 # @Description: 
 # @FilePath: /LR-learning/rl/model/loss/ppo_loss.py
@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 def policy_loss_factory(clip_coef: float):
     def policy_loss(advantages: torch.Tensor, ratio: torch.Tensor):
+        advantages = advantages.unsqueeze(-1)
         p_loss1 = -advantages * ratio
         p_loss2 = -advantages * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
         return torch.max(p_loss1, p_loss2).mean()
