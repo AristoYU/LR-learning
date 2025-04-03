@@ -3,7 +3,7 @@
 """
 # @Author: AristoYU
 # @Date: 2025-03-26 10:03:36
-# @LastEditTime: 2025-04-01 18:54:28
+# @LastEditTime: 2025-04-02 15:04:48
 # @LastEditors: AristoYU
 # @Description: 
 # @FilePath: /LR-learning/rl/model/module/ppo_module.py
@@ -315,13 +315,14 @@ class PPOLightningModule(LightningModule):
         step = 0
         done = False
         cumulative_rew = 0
-        next_obs = torch.tensor(self.val_env.reset(seed=self.hparams.running_cfg.get('seed', 42))[0], device=self.device)
+        next_obs = self.val_env.reset(seed=self.hparams.running_cfg.get('seed', 42))[0].astype(np.float32)
+        next_obs = torch.tensor(next_obs, device=self.device)
         while not done:
             action = self(next_obs, greedy=True)
             next_obs, reward, done, truncate, _ = self.val_env.step(action.cpu().numpy())
             done = done or truncate
             cumulative_rew += reward
-            next_obs = torch.tensor(next_obs, device=self.device)
+            next_obs = torch.tensor(next_obs.astype(np.float32), device=self.device)
             step += 1
 
         self.log('val/episode_reward', cumulative_rew.item(), prog_bar=True, on_step=False, on_epoch=True, logger=True)
@@ -350,13 +351,14 @@ class PPOLightningModule(LightningModule):
         step = 0
         done = False
         cumulative_rew = 0
-        next_obs = torch.tensor(self.test_env.reset(seed=self.hparams.running_cfg.get('seed', 42))[0], device=self.device)
+        next_obs = self.test_env.reset(seed=self.hparams.running_cfg.get('seed', 42))[0].astype(np.float32)
+        next_obs = torch.tensor(next_obs, device=self.device)
         while not done:
             action = self(next_obs, greedy=True)
             next_obs, reward, done, truncate, _ = self.test_env.step(action.cpu().numpy())
             done = done or truncate
             cumulative_rew += reward
-            next_obs = torch.tensor(next_obs, device=self.device)
+            next_obs = torch.tensor(next_obs.astype(np.float32), device=self.device)
             step += 1
 
         self.log('test/episode_reward', cumulative_rew.item(), prog_bar=True, on_step=False, on_epoch=True, logger=True)
@@ -397,7 +399,8 @@ class PPOLightningModule(LightningModule):
         gamma = self.hparams.running_cfg.get('gamma', 0.99)
         gae_lambda = self.hparams.running_cfg.get('gae_lambda', 0.95)
 
-        next_observations = torch.tensor(self.train_envs.reset()[0], device=self.device)
+        next_observations = self.train_envs.reset()[0].astype(np.float32)
+        next_observations = torch.tensor(next_observations, device=self.device)
         next_dones = torch.zeros(self.train_envs.num_envs, device=self.device)
         for step in range(0, num_steps):
             self.observations_buffer[step] = next_observations
@@ -412,7 +415,7 @@ class PPOLightningModule(LightningModule):
             dones = torch.logical_or(torch.tensor(dones), torch.tensor(truncateds))
             self.rewards_buffer[step] = torch.tensor(rewards.astype(np.float32), device=self.device).view(-1)
 
-            next_observations = torch.tensor(next_observations, device=self.device)
+            next_observations = torch.tensor(next_observations.astype(np.float32), device=self.device)
             next_dones = dones.to(self.device)
 
             episode = info.get('episode', None)
@@ -449,12 +452,12 @@ class PPOLightningModule(LightningModule):
 
     @classmethod
     def _load_env(cls, env_cfg: dict, data_cfg: dict, log_root: str = None, seed: int = 42) -> gym.vector.SyncVectorEnv:
-        def make_env(env_type, env_cfg: dict, idx: int):
+        def make_env(env_type, env_cfg: dict, idx: int, interval: int):
             def thunk():
                 env = gym.make(env_type, **env_cfg)
                 env = gym.wrappers.RecordEpisodeStatistics(env)
                 if idx == 0 and log_root:
-                    env = gym.wrappers.RecordVideo(env, log_root)
+                    env = gym.wrappers.RecordVideo(env, log_root, episode_trigger=lambda x: x % interval == 0)
                 env.action_space.seed(seed)
                 env.observation_space.seed(seed)
                 return env
@@ -463,7 +466,8 @@ class PPOLightningModule(LightningModule):
         curr_env_cfg = deepcopy(env_cfg)
         batch_size = data_cfg.get('batch_size', 1)
         env_type = curr_env_cfg.pop('type')
-        envs = gym.vector.SyncVectorEnv([make_env(env_type, curr_env_cfg, _) for _ in range(batch_size)])
+        vis_interval = curr_env_cfg.pop('vis_interval', 10)
+        envs = gym.vector.SyncVectorEnv([make_env(env_type, curr_env_cfg, _, vis_interval) for _ in range(batch_size)])
         return envs
 
     @classmethod
